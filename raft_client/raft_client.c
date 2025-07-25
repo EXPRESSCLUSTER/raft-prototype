@@ -1,5 +1,6 @@
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,8 +16,9 @@ unsigned int num_node;
 unsigned int self_id;
 int leaderId;
 
-#define REQUEST_INTERVAL_SEC 3
-#define RESPONSE_TIMEOUT_SEC 5
+#define RECVTIMEOUT_SEC 0
+#define RECVTIMEOUT_USEC 500
+#define RESPONSE_TIMEOUT_SEC 1
 
 Node_Info *get_node(unsigned int id) {
   Node_Info *current = node_head;
@@ -35,7 +37,7 @@ int get_random_node(int num_node) {
     return -1; // エラー値（必要に応じて調整）
   }
   // rand() % num_node は 0〜(num_node-1) なので、+1 する
-  return (rand() % num_node) + 1;
+  return (rand() % num_node);
 }
 
 int init_nodeinfo() {
@@ -91,26 +93,32 @@ int init_nodeinfo() {
 
 int main(int argc, char *argv[]) {
   int sock;
+  int fifo_fd;
   Raft_Packet send_pkt, recv_pkt;
   Node_Info *pt_node;
   struct sockaddr_in tmp_addr;
   socklen_t tmp_addrlen;
-  struct timeval timeout = {5, 0};
-  struct timespec req_std, req_to;
+  struct timeval timeout;
   struct timespec res_std, res_to;
+  int n = 0;
+  char buf[MAX_COMMAND_LEN];
 
-  req_to.tv_sec = REQUEST_INTERVAL_SEC;
-  req_to.tv_nsec = 0;
-  req_to.tv_sec = REQUEST_INTERVAL_SEC;
-  req_to.tv_nsec = 0;
+  res_to.tv_sec = RESPONSE_TIMEOUT_SEC;
+  res_to.tv_nsec = 0;
+  timeout.tv_sec = RECVTIMEOUT_SEC;
+  timeout.tv_usec = RECVTIMEOUT_USEC;
 
-  // ソケット作成
+  fifo_fd = open(FIFO_NAME, O_RDONLY);
+  if (fifo_fd == -1) {
+    perror("open fifo");
+    return 1;
+  }
+
   if ((sock = socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP)) < 0) {
     perror("socket() failed");
     exit(EXIT_FAILURE);
   }
 
-  // 受信タイムアウト設定
   if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) <
       0) {
     perror("setsockopt() failed");
@@ -131,17 +139,21 @@ int main(int argc, char *argv[]) {
 
   int req_id = 1;
   pt_node = get_node(leaderId);
-  reset_timer(&req_std);
   reset_timer(&res_std);
+  printf("Program started\n");
   while (1) {
     // 送信処理
-    if (check_timeout(req_std, req_to)) {
-      reset_timer(&req_std);
+    if (check_timeout(res_std, res_to)) {
+      reset_timer(&res_std);
+      leaderId = get_random_node(num_node);
+      pt_node = get_node(leaderId);
+      printf("Switch leaderId to %d\n", leaderId);
+    }
+    if (pipe_appended(buf, fifo_fd)) {
       memset(&send_pkt, 0, sizeof(send_pkt));
       send_pkt.packet_type = CLIENT_REQUEST;
       send_pkt.id = CLIENT_ID;
-      snprintf(send_pkt.client_request.log_command, MAX_COMMAND_LEN,
-               "client_request_%d", req_id);
+      snprintf(send_pkt.client_request.log_command, MAX_COMMAND_LEN, buf);
       tmp_addr = pt_node->serv_addr;
       tmp_addrlen = sizeof(struct sockaddr_in);
       if (sendto(sock, &send_pkt, sizeof(send_pkt), 0,
@@ -161,12 +173,6 @@ int main(int argc, char *argv[]) {
       if (errno != EAGAIN && errno != EWOULDBLOCK) {
         perror("recvfrom() failed");
       }
-      if (check_timeout(res_std, res_to)) {
-        reset_timer(&res_std);
-        leaderId = get_random_node(num_node);
-        pt_node = get_node(leaderId);
-        printf("to leaderId:%d\n", leaderId);
-      }
       continue;
     }
 
@@ -174,8 +180,8 @@ int main(int argc, char *argv[]) {
       printf("Received ClientResponse(leaderId:[%d] id:[%d] success: [%d])\n",
              recv_pkt.client_response.leaderId, recv_pkt.client_response.id,
              recv_pkt.client_response.sucess);
+      reset_timer(&res_std);
       if (recv_pkt.client_response.sucess) {
-        reset_timer(&req_std);
         req_id++;
       } else {
         if (leaderId != recv_pkt.client_response.leaderId) {
